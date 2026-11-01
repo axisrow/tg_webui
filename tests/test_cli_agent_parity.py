@@ -9,7 +9,7 @@ from pathlib import Path
 
 from tests.helpers import _route_exists
 
-ROOT = Path(__file__).resolve().parents[3]  # repo root (packages/tg_webui/tests/…)
+ROOT = Path(__file__).resolve().parents[1]  # repo root (tests/…)
 
 
 def _actual_web_routes() -> set[tuple[str, str]]:

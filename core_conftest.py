@@ -1,0 +1,629 @@
+from __future__ import annotations
+
+import asyncio
+import os
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Collection, Mapping
+from unittest.mock import patch
+
+import pytest
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+
+from tests.helpers import RealPoolHarness
+from tg_agent.config import AppConfig, parse_proxy_url
+from tg_agent.database import Database
+from tg_shared.auth import TelegramAuth
+from tg_shared.session_materializer import SessionMaterializer
+
+os.environ.setdefault("SESSION_ENCRYPTION_KEY", "test-session-encryption-key")
+
+# #1699 hermeticity: the real machine OS secret store (a dev Mac's login
+# keychain may legitimately hold the owner's key) must never be consulted by
+# tests. Store-layer tests opt back in and fake the backend subprocess.
+os.environ.setdefault("TG_AGENT_SECRET_STORE", "off")
+
+# The host checkout may legitimately carry a live .tg-agent-global binding
+# (post-#1724 the factory's own marker IS a binding). Tests must see an
+# UNenrolled project unless they enroll their own tmp cwd: whenever the repo
+# root carries the host marker, binding lookups that resolve to it report
+# "no binding". Tests that enroll themselves write their marker into their
+# tmp cwd, which this never touches. Legacy plain-path markers were already
+# invisible to read_binding, so this only changes JSON bindings.
+_REPO_HOST_MARKER = Path(__file__).resolve().parent.parent / ".tg-agent-global"
+
+
+@pytest.fixture(autouse=True)
+def _hide_host_gateway_binding(monkeypatch):
+    from tg_agent.gateway.project import read_binding as _real_read_binding
+
+    def _host_blind_read_binding(marker_path):
+        if marker_path == _REPO_HOST_MARKER:
+            return None
+        return _real_read_binding(marker_path)
+
+    monkeypatch.setattr(
+        "tg_agent.gateway.project.read_binding", _host_blind_read_binding
+    )
+    yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _reuse_test_session_key():
+    """Derive the shared test key once per worker; keep real Fernet encryption.
+
+    Thousands of DB/provider fixtures use this same public test password.
+    PBKDF2 is deliberately expensive in production, but repeating that pure
+    computation adds no coverage here. Other secrets and changes to the KDF
+    parameters/implementation always take the real derivation path.
+    """
+    from tg_agent.security import session_cipher
+
+    derive = session_cipher._derive_fernet_key_v2
+    secret = "test-session-encryption-key"
+    parameters = (session_cipher._PBKDF2_SALT, session_cipher._PBKDF2_ITERATIONS, session_cipher.hashlib.pbkdf2_hmac)
+    key = derive(secret)
+
+    def derive_test_key(value):
+        current = (session_cipher._PBKDF2_SALT, session_cipher._PBKDF2_ITERATIONS, session_cipher.hashlib.pbkdf2_hmac)
+        if value == secret and current == parameters:
+            return key
+        return derive(value)
+
+    with patch.object(session_cipher, "_derive_fernet_key_v2", derive_test_key):
+        yield
+
+
+@pytest.fixture(scope="session")
+def anyio_backend() -> str:
+    """Force asyncio backend for the entire suite — no trio."""
+    return "asyncio"
+
+
+REAL_TG_SAFE_MARK = "real_tg_safe"
+REAL_TG_MUTATION_SAFE_MARK = "real_tg_mutation_safe"
+REAL_TG_MANUAL_MARK = "real_tg_manual"
+REAL_TG_NEVER_MARK = "real_tg_never"
+REAL_TG_LIVE_FIXTURE = "real_telegram_sandbox"
+CLI_REAL_TG_LIVE_FIXTURE = "cli_real_cli_env"
+REAL_TG_LIVE_FIXTURES = (REAL_TG_LIVE_FIXTURE, CLI_REAL_TG_LIVE_FIXTURE)
+REAL_TG_SAFE_GATE_ENV = "RUN_REAL_TELEGRAM_SAFE"
+REAL_TG_MUTATION_SAFE_GATE_ENV = "RUN_REAL_TELEGRAM_MUTATION_SAFE"
+REAL_TG_MANUAL_GATE_ENV = "RUN_REAL_TELEGRAM_MANUAL"
+REAL_TG_REQUIRED_ENV_VARS = (
+    "REAL_TG_API_ID",
+    "REAL_TG_API_HASH",
+    "REAL_TG_PHONE",
+    "REAL_TG_SESSION",
+)
+REAL_TG_OPTIONAL_ENV_VARS = (
+    "REAL_TG_READ_CHANNEL_USERNAME",
+    "REAL_TG_READ_CHANNEL_ID",
+    "REAL_TG_PRIVATE_CHAT_ID",
+    "REAL_TG_BOT_USERNAME",
+)
+
+
+@pytest.fixture
+async def db(anyio_backend):
+    """In-memory test database."""
+    database = Database(":memory:", session_encryption_secret="test-session-encryption-key")
+    await database.initialize()
+    yield database
+    await database.close()
+
+
+@pytest.fixture
+def cli_db(tmp_path):
+    """Sync fixture: real SQLite for CLI tests."""
+    db_path = str(tmp_path / "cli_test.db")
+    database = Database(db_path, session_encryption_secret="test-session-encryption-key")
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(database.initialize())
+        yield database
+    finally:
+        try:
+            loop.run_until_complete(database.close())
+        finally:
+            loop.close()
+
+
+@pytest.fixture
+def cli_env(cli_db):
+    """Patch runtime.init_db to return real db without loading config.yaml."""
+    config = AppConfig()
+
+    async def fake_init_db(config_path: str):
+        return config, cli_db
+
+    with patch("tg_agent.cli.runtime.init_db", side_effect=fake_init_db):
+        yield cli_db
+
+
+# Databases handed to cli_init_patch in the CURRENT test. Closed by the
+# autouse finalizer below — after the test ends, when nothing can legally use
+# them anymore. Left open, their aiosqlite connections are GC-finalized mid
+# suite and filterwarnings=error attributes the unraisable warning to a random
+# later test. CLI commands close their own db via finallys today, so the net
+# is dormant — it exists for callers that skip theirs. A failed close is left
+# in the registry (the next teardown retries) and surfaces as a teardown
+# error, so a leak is visible instead of swallowed.
+_PATCHED_DBS: list[Database] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_patched_databases():
+    yield
+    while _PATCHED_DBS:
+        db = _PATCHED_DBS[0]
+        if db._connection.db is not None:
+            asyncio.run(db.close())
+        _PATCHED_DBS.pop(0)
+
+
+@pytest.fixture
+def cli_init_patch():
+    """Patch one or more CLI init_db targets to return the provided database."""
+
+    @contextmanager
+    def _patch(
+        db,
+        *targets: str,
+        config: AppConfig | None = None,
+        fresh_database: bool = False,
+    ):
+        runtime_config = config or AppConfig()
+        fresh_databases: list[Database] = []
+        if isinstance(db, Database):
+            _PATCHED_DBS.append(db)
+
+        async def fake_init_db(_config_path: str):
+            if isinstance(db, Database) and fresh_database:
+                cmd_db = Database(db._db_path, session_encryption_secret=db._session_encryption_secret)
+                await cmd_db.initialize()
+                fresh_databases.append(cmd_db)
+                return runtime_config, cmd_db
+            if isinstance(db, Database) and db._connection.db is None:
+                await db.initialize()
+            return runtime_config, db
+
+        with ExitStack() as stack:
+            for target in targets:
+                stack.enter_context(patch(target, side_effect=fake_init_db))
+            try:
+                yield runtime_config, db
+            finally:
+                for cmd_db in fresh_databases:
+                    asyncio.run(cmd_db.close())
+
+    return _patch
+
+
+@pytest.fixture
+def config():
+    return AppConfig()
+
+
+@dataclass(frozen=True)
+class RealTelegramSandboxConfig:
+    api_id: int
+    api_hash: str
+    phone: str
+    session_string: str
+    saved_messages_target: str = "me"
+    read_channel_username: str | None = None
+    read_channel_id: int | None = None
+    private_chat_id: int | None = None
+    bot_username: str | None = None
+
+
+@dataclass(frozen=True)
+class RealTelegramSandbox:
+    client: TelegramClient
+    api_id: int
+    api_hash: str
+    phone: str
+    session_string: str
+    saved_messages_target: str = "me"
+    read_channel_username: str | None = None
+    read_channel_id: int | None = None
+    private_chat_id: int | None = None
+    bot_username: str | None = None
+
+
+def _resolve_real_tg_mode(node) -> str | None:
+    markers = [
+        name
+        for name in (
+            REAL_TG_SAFE_MARK,
+            REAL_TG_MUTATION_SAFE_MARK,
+            REAL_TG_MANUAL_MARK,
+            REAL_TG_NEVER_MARK,
+        )
+        if node.get_closest_marker(name)
+    ]
+    if len(markers) > 1:
+        raise pytest.UsageError(
+            f"{node.nodeid} uses multiple real Telegram policy markers: {', '.join(markers)}"
+        )
+    return markers[0] if markers else None
+
+
+def _evaluate_real_tg_policy(
+    *,
+    mode: str | None,
+    fixturenames: Collection[str],
+    environ: Mapping[str, str],
+    gate_enabled: Callable[[str, Mapping[str, str]], bool] | None = None,
+) -> tuple[str | None, str | None]:
+    if gate_enabled is None:
+        from tests.live_readiness import _gate_enabled as gate_enabled
+
+    uses_live_fixture = any(fixture in fixturenames for fixture in REAL_TG_LIVE_FIXTURES)
+    cli_live = CLI_REAL_TG_LIVE_FIXTURE in fixturenames
+
+    def _gate(env_name: str) -> bool:
+        # Every live-Telegram gate is opt-in only. CLI-live tests route through
+        # the shared _gate_enabled helper (true/false-token aware); the
+        # real_telegram_sandbox fixture keeps the strict "must be 1" check.
+        # Neither auto-enables — these tests act on a real account and must never
+        # start without an explicit RUN_*=1.
+        if cli_live:
+            return gate_enabled(env_name, environ)
+        return environ.get(env_name) == "1"
+
+    if uses_live_fixture and mode is None:
+        return (
+            "fail",
+            f"real Telegram fixtures ({', '.join(REAL_TG_LIVE_FIXTURES)}) "
+            f"require @{REAL_TG_SAFE_MARK}, @{REAL_TG_MUTATION_SAFE_MARK}, "
+            f"or @{REAL_TG_MANUAL_MARK}.",
+        )
+
+    if (
+        mode in {REAL_TG_SAFE_MARK, REAL_TG_MUTATION_SAFE_MARK, REAL_TG_MANUAL_MARK}
+        and not uses_live_fixture
+    ):
+        return (
+            "fail",
+            f"@{mode} tests must use one of: {', '.join(REAL_TG_LIVE_FIXTURES)}.",
+        )
+
+    if mode == REAL_TG_NEVER_MARK and uses_live_fixture:
+        return (
+            "fail",
+            f"@{REAL_TG_NEVER_MARK} tests cannot request real Telegram fixtures.",
+        )
+
+    if mode == REAL_TG_SAFE_MARK and not _gate(REAL_TG_SAFE_GATE_ENV):
+        return (
+            "skip",
+            f"real Telegram safe tests are disabled; set {REAL_TG_SAFE_GATE_ENV}=1 to run them.",
+        )
+
+    if mode == REAL_TG_MUTATION_SAFE_MARK and not _gate(REAL_TG_MUTATION_SAFE_GATE_ENV):
+        return (
+            "skip",
+            "real Telegram mutation-safe tests are disabled; "
+            f"set {REAL_TG_MUTATION_SAFE_GATE_ENV}=1 to run them.",
+        )
+
+    if mode == REAL_TG_MANUAL_MARK and not _gate(REAL_TG_MANUAL_GATE_ENV):
+        return (
+            "skip",
+            "real Telegram manual tests are disabled; "
+            f"set {REAL_TG_MANUAL_GATE_ENV}=1 to run them.",
+        )
+
+    return None, None
+
+
+def _build_real_telegram_sandbox_config(
+    environ: Mapping[str, str],
+) -> RealTelegramSandboxConfig:
+    missing = [name for name in REAL_TG_REQUIRED_ENV_VARS if not environ.get(name)]
+    if missing:
+        raise RuntimeError(
+            "Missing real Telegram sandbox environment variables: "
+            + ", ".join(missing)
+            + ". Dedicated REAL_TG_* vars are required; generic TG_* vars are not used."
+        )
+
+    def _optional_int(name: str) -> int | None:
+        raw = environ.get(name)
+        return int(raw) if raw else None
+
+    return RealTelegramSandboxConfig(
+        api_id=int(environ["REAL_TG_API_ID"]),
+        api_hash=environ["REAL_TG_API_HASH"],
+        phone=environ["REAL_TG_PHONE"],
+        session_string=environ["REAL_TG_SESSION"],
+        read_channel_username=environ.get("REAL_TG_READ_CHANNEL_USERNAME") or None,
+        read_channel_id=_optional_int("REAL_TG_READ_CHANNEL_ID"),
+        private_chat_id=_optional_int("REAL_TG_PRIVATE_CHAT_ID"),
+        bot_username=environ.get("REAL_TG_BOT_USERNAME") or None,
+    )
+
+
+@dataclass
+class TelethonCliSpy:
+    queued_clients: list[object] = field(default_factory=list)
+    created: list[tuple[object, object]] = field(default_factory=list)
+    default_client: object | None = None
+    factory: Callable[[object], object] | None = None
+    by_phone: dict[str, object] = field(default_factory=dict)
+
+    def enqueue(self, client: object) -> object:
+        self.queued_clients.append(client)
+        return client
+
+    def bind(self, phone: str, client: object) -> object:
+        self.by_phone[phone.lstrip("+") or "account"] = client
+        return client
+
+
+@dataclass
+class NativeAuthSpy:
+    queued_clients: list[object] = field(default_factory=list)
+    created: list[tuple[str, object]] = field(default_factory=list)
+    default_client: object | None = None
+    factory: Callable[[str], object] | None = None
+    by_session: dict[str, object] = field(default_factory=dict)
+
+    def enqueue(self, client: object) -> object:
+        self.queued_clients.append(client)
+        return client
+
+    def bind(self, session_string: str, client: object) -> object:
+        self.by_session[session_string] = client
+        return client
+
+
+@pytest.fixture
+def telethon_cli_spy():
+    return TelethonCliSpy()
+
+
+@pytest.fixture
+def native_auth_spy():
+    return NativeAuthSpy()
+
+
+@pytest.fixture
+def real_pool_harness_factory(db, telethon_cli_spy, native_auth_spy, tmp_path):
+    def _factory(
+        *,
+        backend_mode: str = "auto",
+        cli_transport: str = "hybrid",
+        session_cache_dir: str | Path | None = None,
+        auth: TelegramAuth | None = None,
+    ):
+        return RealPoolHarness.build(
+            db=db,
+            telethon_cli_spy=telethon_cli_spy,
+            native_auth_spy=native_auth_spy,
+            backend_mode=backend_mode,
+            cli_transport=cli_transport,
+            session_cache_dir=session_cache_dir or (tmp_path / "sessions"),
+            auth=auth,
+        )
+
+    return _factory
+
+
+@pytest.fixture
+async def real_telegram_sandbox():
+    cfg = _build_real_telegram_sandbox_config(os.environ)
+    # TG_PROXY is a network setting, not an identity var (identity vars are
+    # refused below) — the live sandbox honors it so gated real-TG runs work
+    # on networks where MTProto is blocked.
+    client = TelegramClient(
+        StringSession(cfg.session_string),
+        cfg.api_id,
+        cfg.api_hash,
+        proxy=parse_proxy_url(os.environ.get("TG_PROXY", "")),
+    )
+    await client.connect()
+    try:
+        if not await client.is_user_authorized():
+            raise RuntimeError(
+                "REAL_TG_SESSION is not authorized for the configured sandbox account."
+            )
+        yield RealTelegramSandbox(
+            client=client,
+            api_id=cfg.api_id,
+            api_hash=cfg.api_hash,
+            phone=cfg.phone,
+            session_string=cfg.session_string,
+            saved_messages_target=cfg.saved_messages_target,
+            read_channel_username=cfg.read_channel_username,
+            read_channel_id=cfg.read_channel_id,
+            private_chat_id=cfg.private_chat_id,
+            bot_username=cfg.bot_username,
+        )
+    finally:
+        await client.disconnect()
+
+
+def pytest_runtest_setup(item):
+    mode = _resolve_real_tg_mode(item)
+    action, message = _evaluate_real_tg_policy(
+        mode=mode,
+        fixturenames=item.fixturenames,
+        environ=os.environ,
+    )
+    if action == "skip":
+        pytest.skip(message)
+    if action == "fail":
+        pytest.fail(message, pytrace=False)
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    if not config.pluginmanager.hasplugin("xdist"):
+        return
+
+    for item in items:
+        if item.get_closest_marker("aiosqlite_serial"):
+            item.add_marker(pytest.mark.xdist_group("aiosqlite_serial"))
+
+
+@pytest.fixture(autouse=True)
+def no_running_server(request, monkeypatch):
+    """Pin ``serve_is_running`` to False so tests never read the real PID file.
+
+    ``AppConfig()`` defaults point at the production ``data/tg_search.pid``, so
+    without this a developer running ``serve`` locally would flip CLI commands
+    onto the worker hand-off path while CI (no server) took the direct path —
+    the same suite passing or failing depending on what else is running on the
+    machine. Tests that exercise the hand-off patch this per-test.
+    """
+    if any(fixture in request.fixturenames for fixture in REAL_TG_LIVE_FIXTURES):
+        return
+    monkeypatch.setattr(
+        "tg_agent.cli.worker_handoff.serve_is_running", lambda _config: False, raising=False
+    )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_session_locks(monkeypatch, tmp_path, request):
+    """Point cross-process session locks (#1548) at a per-test lock directory.
+
+    Tests hardcode session strings; without isolation, two xdist workers are
+    real OS processes and would contend on the shared-tempdir lock for the
+    same string, stalling unrelated tests for the grace period. Live real-TG
+    runs keep the default directory so the lock guards real processes.
+    """
+    if any(fixture in request.fixturenames for fixture in REAL_TG_LIVE_FIXTURES):
+        return
+    monkeypatch.setenv("TGCF_SESSION_LOCK_DIR", str(tmp_path / "session-locks"))
+    monkeypatch.setenv("TGCF_SESSION_LOCK_GRACE_SECONDS", "0.05")
+
+
+@pytest.fixture(autouse=True)
+def _enforce_cli_transport(
+    monkeypatch,
+    request,
+    telethon_cli_spy: TelethonCliSpy,
+    native_auth_spy: NativeAuthSpy,
+    tmp_path,
+):
+    if any(fixture in request.fixturenames for fixture in REAL_TG_LIVE_FIXTURES):
+        return
+
+    def _fake_create_client(namespace):
+        if telethon_cli_spy.queued_clients:
+            client = telethon_cli_spy.queued_clients.pop(0)
+        elif Path(str(namespace.session)).name in telethon_cli_spy.by_phone:
+            client = telethon_cli_spy.by_phone[Path(str(namespace.session)).name]
+        elif telethon_cli_spy.factory is not None:
+            client = telethon_cli_spy.factory(namespace)
+        elif telethon_cli_spy.default_client is not None:
+            client = telethon_cli_spy.default_client
+        else:
+            raise AssertionError(
+                "telethon_cli_spy has no queued/bound/default client for namespace "
+                f"{namespace!r}. Use harness.queue_cli_client() or telethon_cli_spy.enqueue()."
+            )
+        telethon_cli_spy.created.append((namespace, client))
+        return client
+
+    monkeypatch.setattr(
+        "tg_agent.telegram.backends.telethon_cli_runtime.create_client",
+        _fake_create_client,
+    )
+
+    if not request.node.get_closest_marker("real_materializer"):
+
+        def _fake_materialize(self: SessionMaterializer, phone: str, session_string: str) -> str:
+            safe_phone = phone.lstrip("+") or "account"
+            target = Path(tmp_path) / "materialized_sessions" / safe_phone
+            target.parent.mkdir(parents=True, exist_ok=True)
+            return str(target)
+
+        monkeypatch.setattr(SessionMaterializer, "materialize", _fake_materialize)
+
+    if request.node.get_closest_marker("native_backend_allowed"):
+
+        async def _fake_native_transport(self, session_string: str, *, base_logger=None):
+            if native_auth_spy.queued_clients:
+                client = native_auth_spy.queued_clients.pop(0)
+            elif session_string in native_auth_spy.by_session:
+                client = native_auth_spy.by_session[session_string]
+            elif native_auth_spy.factory is not None:
+                client = native_auth_spy.factory(session_string)
+            elif native_auth_spy.default_client is not None:
+                client = native_auth_spy.default_client
+            else:
+                raise AssertionError(
+                    "native_auth_spy has no queued/bound/default client for session "
+                    f"{session_string!r}. Use harness.queue_native_client() or "
+                    "native_auth_spy.enqueue()."
+                )
+            native_auth_spy.created.append((session_string, client))
+            return client
+
+        monkeypatch.setattr(TelegramAuth, "create_client_from_session", _fake_native_transport)
+        return
+
+    async def _forbid_native_transport(self, session_string: str, *, base_logger=None):
+        raise AssertionError(
+            "Native Telethon transport is forbidden in this test. "
+            "Use telethon-cli-backed runtime or mark the test with native_backend_allowed."
+        )
+
+    monkeypatch.setattr(TelegramAuth, "create_client_from_session", _forbid_native_transport)
+
+
+# ---------------------------------------------------------------------------
+# Agent tools shared helpers
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mock_db():
+    """Mock Database for agent tool tests."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    db = MagicMock(spec=Database)
+    db.get_setting = AsyncMock(return_value=None)
+    db.set_setting = AsyncMock()
+    db.get_stats = AsyncMock(return_value={"channels": 10, "messages": 1000})
+    return db
+
+
+@pytest.fixture
+def pin_codex(monkeypatch):
+    """Force the keyless-codex detection result for a test.
+
+    Registration flows through ``provider_adapters.codex_available`` (an
+    lru_cache'd predicate), so patch it at the source and drop the cache.
+    Returns a ``pin(available: bool)`` callable.
+    """
+    from tg_agent.services import provider_adapters
+
+    def _pin(available: bool) -> None:
+        provider_adapters.codex_available.cache_clear()
+        monkeypatch.setattr(provider_adapters, "codex_available", lambda: available)
+
+    return _pin
+
+
+@pytest.fixture(autouse=True)
+def fail_on_mock_path_leak():
+    """A MagicMock that reached filesystem code creates junk dirs in cwd (PR #1715).
+
+    ``os.fspath`` of a MagicMock yields a repo-relative ``MagicMock/...`` path,
+    so any test passing a mock where a real path is expected silently litters
+    the repository root. Fail the leaking test instead of committing its junk.
+    """
+    marker = Path("MagicMock")
+    existed = marker.exists()
+    yield
+    if marker.exists() and not existed:
+        pytest.fail(
+            "Test leaked a MagicMock-as-path directory into the repository root: "
+            "a mock object was used where a real filesystem path is expected"
+        )

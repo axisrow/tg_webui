@@ -52,3 +52,31 @@ tg_webui = [
     "static/js/*.js",
     "py.typed",
 ]
+
+[tool.pytest.ini_options]
+anyio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+# Keep pytest-timeout as a deadlock guard; xdist workers can be CPU-starved on shared dev hosts.
+timeout = 120
+addopts = "--dist=loadfile"
+filterwarnings = ["error"]
+markers = [
+    "unit: test level — pure logic, no DB/HTTP/real-IO (fast); auto-applied by conftest heuristic",
+    "integration: test level — exercises in-process subsystems (SQLite, FastAPI client, dispatchers); auto-applied by conftest heuristic",
+    "smoke: fast offline preflight over real project functions (critical paths); curated subset, applied alongside a level marker",
+    "native_backend_allowed: test intentionally exercises explicit native Telethon allowlist flows",
+    "real_tg_safe: opt-in real Telegram API test with no Telegram-visible mutations",
+    "real_tg_mutation_safe: opt-in real Telegram API test for bounded operator-approved Telegram-visible mutations",
+    "real_tg_manual: opt-in real Telegram API test for manual/high-risk Telegram-visible scenarios",
+    "real_tg_never: test must never request a real Telegram client fixture",
+    "telegram_unit: pure unit test that does not verify backend transport wiring",
+    "real_materializer: test uses real SessionMaterializer instead of the fake stub",
+    "real_provider_smoke: opt-in live provider API smoke test",
+    "aiosqlite_serial: tests in one file must stay together while independent files may use xdist workers",
+    "codex_image_live: opt-in live Codex SDK image generation test; gate: RUN_CODEX_IMAGE_LIVE=1",
+    "codex_cli_live: opt-in live Codex CLI smoke (image + agent backend via real MCP); gate: RUN_CODEX_CLI_LIVE=1",
+    "e2e: end-to-end browser test using Playwright",
+    "slow: test is intrinsically slow (real timers/sleeps that can't be scaled away); excluded from the fast feedback loop with `-m 'not slow'`",
+    "mutmut_skip: excluded from mutation runs (repo-contract AST/surface scans, out-of-process spawns, network-flaky)",
+]

@@ -21,7 +21,7 @@ pytestmark = [pytest.mark.anyio, pytest.mark.aiosqlite_serial]
 async def digest_host(base_app, tmp_path, monkeypatch):
     app, db, _pool = base_app
     # Actual package metadata as installed by pip, not a mocked entry-point loader.
-    root = Path(__file__).parents[4]  # repo root (packages/tg_webui/tests/routes/…)
+    root = Path(__file__).parents[2]  # repo root (tests/routes/…)
     monkeypatch.syspath_prepend(str(root / 'examples' / 'plugin_digest'))
     distribution = tmp_path / 'digest_example-0.1.0.dist-info'
     distribution.mkdir()

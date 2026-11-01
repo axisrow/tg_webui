@@ -14,9 +14,9 @@ from pathlib import Path
 
 import pytest
 
-import tests.conftest as _core
-from tests.conftest import *  # noqa: F403 — public fixtures (db, cli_env, real_pool_harness_factory, ...)
-from tests.conftest import (  # noqa: F401 — private autouse fixtures, not covered by the star import
+import core_conftest as _core
+from core_conftest import *  # noqa: F403 — public fixtures (db, cli_env, real_pool_harness_factory, ...)
+from core_conftest import (  # noqa: F401 — private autouse fixtures, not covered by the star import
     _close_patched_databases,
     _enforce_cli_transport,
     _hide_host_gateway_binding,

@@ -491,7 +491,7 @@ async def test_chat_enables_interactive_permissions(client, db):
 
 def test_permission_dialog_items_all_have_cursor_span():
     """Every permission menu item must satisfy highlight()'s .perm-cursor lookup."""
-    template = Path("packages/tg_webui/src/tg_webui/templates/agent.html").read_text(encoding="utf-8")
+    template = Path("src/tg_webui/templates/agent.html").read_text(encoding="utf-8")
     for choice in ("once", "session", "deny"):
         marker = f'class="perm-item" data-choice="{choice}"'
         start = template.index(marker)
@@ -502,7 +502,7 @@ def test_permission_dialog_items_all_have_cursor_span():
 
 def test_permission_dialog_keyboard_and_post_contract():
     """Pressing 2 must map to session and POST failures must not auto-deny."""
-    template = Path("packages/tg_webui/src/tg_webui/templates/agent.html").read_text(encoding="utf-8")
+    template = Path("src/tg_webui/templates/agent.html").read_text(encoding="utf-8")
 
     assert "document.addEventListener('keydown', onKey, true)" in template
     assert "document.removeEventListener('keydown', onKey, true)" in template

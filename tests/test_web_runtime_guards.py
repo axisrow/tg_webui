@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import tg_agent
+
 # Anchored to this file, not the cwd: a cwd-relative path that does not resolve
 # makes the scans below find nothing and pass silently.
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-_WEB_DIR = _REPO_ROOT / "packages" / "tg_webui" / "src" / "tg_webui"
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_WEB_DIR = _REPO_ROOT / "src" / "tg_webui"
+# Core services live in the installed tg-agent distribution (monorepo checkout).
+_CORE_SERVICES_DIR = Path(tg_agent.__file__).resolve().parent / "services"
 
 # Tokens that indicate a live ClientPool / Collector / scheduler call happening
 # inside a web request. All Telegram RPC must go through telegram_commands
@@ -143,7 +147,7 @@ def test_account_service_not_imported_by_web() -> None:
 
 def test_web_consumed_services_do_not_call_live_pool_methods() -> None:
     """Services imported by web routes/deps must stay off the live pool."""
-    services_dir = _REPO_ROOT / "tg_agent" / "services"
+    services_dir = _CORE_SERVICES_DIR
     assert services_dir.is_dir(), services_dir
     offenders: list[str] = []
     for name in _WEB_CONSUMED_SERVICES:
