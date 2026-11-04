@@ -1724,6 +1724,45 @@ async def test_search_telegram_proxy_renders_worker_result(client, monkeypatch):
     assert fake_cmd_service.enqueue.await_args.args[0] == "search.telegram"
 
 
+@pytest.mark.anyio
+async def test_search_telegram_proxy_passes_date_window(client, monkeypatch):
+    """#1750: date_from/date_to from the form ride along in the worker payload."""
+    from tg_agent.models import SearchResult, TelegramCommand, TelegramCommandStatus
+    from tg_webui import deps
+
+    monkeypatch.setattr("tg_webui.routes.scheduler._is_worker_alive", AsyncMock(return_value=True))
+    _connect_pool(client)
+
+    command = TelegramCommand(
+        id=100,
+        command_type="search.telegram",
+        status=TelegramCommandStatus.SUCCEEDED,
+        result_payload=SearchResult(messages=[], total=0, query="test").model_dump(mode="json"),
+    )
+    fake_cmd_service = SimpleNamespace(
+        enqueue=AsyncMock(return_value=100),
+        get=AsyncMock(return_value=command),
+    )
+    monkeypatch.setattr(deps, "telegram_command_service", lambda request: fake_cmd_service)
+
+    resp = await client.get(
+        "/search/fragments/results?q=test&mode=telegram"
+        "&date_from=2026-10-19&date_to=2026-11-02"
+    )
+
+    assert resp.status_code == 200
+    payload = fake_cmd_service.enqueue.await_args.kwargs["payload"]
+    assert payload["date_from"] == "2026-10-19"
+    assert payload["date_to"] == "2026-11-02"
+
+    # No dates in the query → no window keys in the payload.
+    resp = await client.get("/search/fragments/results?q=test&mode=telegram")
+    assert resp.status_code == 200
+    payload = fake_cmd_service.enqueue.await_args.kwargs["payload"]
+    assert "date_from" not in payload
+    assert "date_to" not in payload
+
+
 def test_search_telegram_proxy_timeout_covers_premium_worker_bounds():
     from tg_agent.search.telegram_search import PREMIUM_SEARCH_RPC_TIMEOUT_SEC
     from tg_webui.search import handlers as search_handlers
