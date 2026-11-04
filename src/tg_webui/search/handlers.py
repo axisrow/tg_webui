@@ -45,12 +45,15 @@ async def _telegram_search_via_worker(
     query: str,
     limit: int,
     channel_id: int | None,
+    date_from: str = "",
+    date_to: str = "",
 ) -> SearchResult:
     """Proxy a live Telegram search to the worker and await its result (#643).
 
     The web container cannot open Telegram connections, so it enqueues a
     ``search.telegram`` command and polls ``telegram_commands.result_payload``
-    until the worker (embedded or standalone) finishes it.
+    until the worker (embedded or standalone) finishes it. ``date_from``/
+    ``date_to`` ride along for the telegram mode (#1750 client-side window).
     """
     from tg_webui.routes.scheduler import _is_worker_alive
 
@@ -66,6 +69,10 @@ async def _telegram_search_via_worker(
     payload: dict = {"mode": mode, "query": query, "limit": limit}
     if channel_id is not None:
         payload["channel_id"] = channel_id
+    if date_from:
+        payload["date_from"] = date_from
+    if date_to:
+        payload["date_to"] = date_to
     command_id = await cmd_service.enqueue(
         "search.telegram", payload=payload, requested_by="web:search"
     )
@@ -381,7 +388,13 @@ async def render_search_results(
             # Web container has no live ClientPool — run it on the worker (#643).
             result = await _safe_search(
                 _telegram_search_via_worker(
-                    request, mode=mode, query=ctx.fts_query, limit=limit, channel_id=channel_id_int
+                    request,
+                    mode=mode,
+                    query=ctx.fts_query,
+                    limit=limit,
+                    channel_id=channel_id_int,
+                    date_from=date_from,
+                    date_to=date_to,
                 ),
                 log_msg="Worker search proxy failed: mode=%s query_hash=%s",
                 log_args=(mode, query_log_fields(q)["query_hash"]),
